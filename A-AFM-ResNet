@@ -1,0 +1,213 @@
+import torch.nn as nn
+from torch.nn import functional as F
+import torch
+
+# 残差模块
+class ResBlk(nn.Module):
+    def __init__(self,ch_in,ch_out,stride=1):
+        super(ResBlk,self).__init__()
+
+        self.conv1 = nn.Conv2d(ch_in,ch_out,kernel_size=3,stride=stride,padding=1)
+        self.bn1 = nn.BatchNorm2d(ch_out)
+        self.conv2 = nn.Conv2d(ch_out,ch_out,kernel_size=3,stride=1,padding=1)
+        self.bn2 = nn.BatchNorm2d(ch_out)
+
+        self.extra = nn.Sequential()
+
+        if ch_out!=ch_in:
+            self.extra = nn.Sequential(
+                nn.Conv2d(ch_in,ch_out,kernel_size=1,stride=stride),
+                nn.BatchNorm2d(ch_out)
+            )
+
+    def forward(self,x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out)) 
+        out = self.extra(x)+out
+        out = F.relu(out)
+        return out
+
+# 计算局部区域的相关系数
+def cal_pccs(x, y, n):
+    """
+    warning: data format must be narray
+    :param x: Variable 1
+    :param y: The variable 2
+    :param n: The number of elements in x
+    :return: pccs
+    """
+    pcc_result = torch.zeros((x.shape[0], 1))
+    # 遍历所有样本
+    for i in range(x.shape[0]):
+        sum_xy = torch.sum(torch.sum(x[i]*y[i]))
+        sum_x = torch.sum(torch.sum(x[i]))
+        sum_y = torch.sum(torch.sum(y[i]))
+        sum_x2 = torch.sum(torch.sum(x[i] * x[i]))
+        sum_y2 = torch.sum(torch.sum(y[i] * y[i]))
+        pcc = (n*sum_xy-sum_x*sum_y)/torch.sqrt((n*sum_x2-sum_x*sum_x)*(n*sum_y2-sum_y*sum_y))
+        pcc_result[i] = pcc
+
+    return pcc_result
+
+# 循环计算整个输入特征图的相关性
+def cal_pccs_similarity(F_PAN, F_MS, stride = 2):
+    
+    arr_width = F_PAN.shape[3]
+    arr_height = F_PAN.shape[2]
+    c = F_PAN.shape[1]
+    
+    pcc_result = torch.zeros((F_PAN.shape[0], F_PAN.shape[2], F_PAN.shape[3]))
+    for x in range(0, arr_height + 1, stride):
+        for y in range(0, arr_width + 1, stride):
+            if x != 0 and y != 0:
+                F_PAN_slide = F_PAN[:,:, x - stride : x, y - stride : y]
+                F_MS_slide = F_MS[:,:, x - stride : x, y - stride : y]
+                result = cal_pccs(F_PAN_slide, F_MS_slide, F_PAN_slide.shape[1] * F_PAN_slide.shape[2] * F_PAN_slide.shape[3])
+                for i in range(result.shape[0]):
+                    pcc_result[i, x - stride : x, y - stride : y] = result[i]
+    pcc_result = torch.unsqueeze(pcc_result, axis=1)
+    pcc_result = pcc_result.repeat(1,c,1,1)
+
+    return pcc_result
+
+# 自适应特征渐进迁移融合单元
+class FPMF(nn.Module):
+    def __init__(self):
+        super(FPMF,self).__init__()
+    
+    def forward(self,F_PAN,F_MS):
+        coef_F_PAN_F_MS = cal_pccs_similarity(F_PAN, F_MS)
+        S_F_PAN = torch.add(torch.mul((1-coef_F_PAN_F_MS),F_PAN),torch.mul(coef_F_PAN_F_MS,F_MS))
+        S_F_MS = torch.add(torch.mul(coef_F_PAN_F_MS,F_PAN),torch.mul((1-coef_F_PAN_F_MS),F_MS))
+
+        return S_F_PAN,S_F_MS
+
+# 自适应层特征融合模块        
+class ALFM(nn.Module):
+    def __init__(self): 
+        super(ALFM,self).__init__()
+        self.global_pool = nn.AdaptiveAvgPool2d((1,1))
+        self.softmax = nn.Softmax(dim=1)
+    def forward(self, F_0, F_1, F_2, F_3,F_4):
+        # 压缩空间信息
+        a0 = self.global_pool(F_0)
+        a1 = self.global_pool(F_1)
+        a2 = self.global_pool(F_2)
+        a3 = self.global_pool(F_3)
+        a4 = self.global_pool(F_4)
+        # 压缩通道信息
+        b0 = torch.mean(a0, dim=1, keepdim=True)
+        b1 = torch.mean(a1, dim=1, keepdim=True)
+        b2 = torch.mean(a2, dim=1, keepdim=True)
+        b3 = torch.mean(a3, dim=1, keepdim=True)
+        b4 = torch.mean(a4, dim=1, keepdim=True)
+        # 拼接不能层的特征
+        b = torch.cat([b0,b1,b2,b3,b4],1)
+        # 通过softmax计算每层的权重
+        y = self.softmax(b)
+        # 将不同层次的权重分开
+        y0, y1, y2, y3, y4 = y[1][0], y[1][1], y[1][2], y[1][3], y[1][4]
+        c = y0 + y1 + y2 + y3 + y4
+        # 自适应融合
+        F_5 = torch.cat([torch.mul(F_0,y0), torch.mul(F_1,y1), torch.mul(F_2,y2), torch.mul(F_3,y3), torch.mul(F_4,y4)],1)
+        return F_5
+
+class AAFMResNet(nn.Module):
+    def __init__(self):
+        super(AAFMResNet,self).__init__()
+        
+        self.blk1_1 = ResBlk(8,16)
+        self.blk2_1 = ResBlk(8,16)
+
+        self.blk1_2 = ResBlk(16,24)
+        self.blk2_2 = ResBlk(16,24)
+     
+        self.blk1_3 = ResBlk(24,32)
+        self.blk2_3 = ResBlk(24,32)
+        
+        self.blk1_4 = ResBlk(32,40)
+        self.blk2_4 = ResBlk(32,40)
+        self.FPMF = FPMF()
+        self.ALFM = ALFM()
+
+        self.RP1_1 = nn.Sequential(
+            nn.Conv2d(4, 8, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=False),
+            nn.MaxPool2d(4, 4),
+            nn.ReLU(inplace=False)
+        )  
+
+        self.RP2_1 = nn.Sequential(
+            nn.Conv2d(4, 8, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=False),
+            nn.MaxPool2d(4, 4),
+            nn.ReLU(inplace=False)
+        ) 
+ 
+        self.RP6 = nn.Sequential(
+            nn.Conv2d(120, 40, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(40),
+            nn.ReLU(inplace=False),
+            nn.MaxPool2d(2, 2),
+            nn.ReLU(inplace=False)
+        ) 
+
+        self.fc1 = nn.Linear(in_features=5120, out_features=256)
+        self.fc2 = nn.Linear(in_features=256, out_features=64)
+        self.fc3 = nn.Linear(in_features=64, out_features=11)
+    
+    def forward(self,ms,pan):
+        # ResBlock1
+        out_top0 = self.RP1_1(pan)
+        out_top = self.blk1_1(out_top0)
+        out_bottom0 = self.RP2_1(ms)
+        out_bottom = self.blk2_1(out_bottom0)
+        [out_top,out_bottom] = self.FPMF(out_top,out_bottom)
+        
+        # ResBlock2
+        out_top1 = self.blk1_2(out_top)
+        out_bottom1 = self.blk2_2(out_bottom)
+        [out_top1,out_bottom1] = self.FPMF(out_top1,out_bottom1)
+        
+        # ResBlock3
+        out_top2 = self.blk1_3(out_top1)
+        out_bottom2 = self.blk2_3(out_bottom1)
+        [out_top2,out_bottom2] = self.FPMF(out_top2,out_bottom2)
+       
+        # ResBlock4
+        out_top3 = self.blk1_4(out_top2)
+        out_bottom3 = self.blk2_4(out_bottom2)
+        [out_top3,out_bottom3] = self.FPMF(out_top3,out_bottom3)
+        
+        # ALFM模块 
+        F_PAN_5 = self.ALFM(out_top0,out_top,out_top1,out_top2,out_top3)
+        F_MS_5 = self.ALFM(out_bottom0,out_bottom,out_bottom1,out_bottom2,out_bottom3)  
+       
+        F_PAN_6 = self.RP6(F_PAN_5)
+        F_MS_6 = self.RP6(F_MS_5)
+      
+        # 全连接分类
+        F_PAN_7 = F_PAN_6.view(F_PAN_6.shape[0], -1)
+        F_MS_7 = F_MS_6.view(F_MS_6.shape[0], -1)
+        [n,c] = F_PAN_7.size()
+        
+        # 计算不同空间的相关系数
+        coefxy = cal_pccs(F_PAN_7, F_MS_7,c)
+        input_FC =torch.cat([F_PAN_7,F_MS_7],1)
+        input_FC = F.relu(self.fc1(input_FC))
+        input_FC = F.relu(self.fc2(input_FC))
+        out_FC = self.fc3(input_FC)
+
+        return out_FC,coefxy
+
+if __name__ == "__main__":
+    pan = torch.randn(2, 4, 64, 64)
+    ms = torch.randn(2, 4, 64, 64)
+    grf_net = AAFMResNet()
+    out_result,coefxy = grf_net(ms,pan)
+    print(out_result)
+    print(out_result.shape)
+    print(coefxy)
+    print(coefxy.shape)
